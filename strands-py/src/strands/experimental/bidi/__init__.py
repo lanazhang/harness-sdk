@@ -14,6 +14,9 @@ from .agent.agent import BidiAgent
 # Model interface (for custom implementations)
 from .models.model import BidiModel
 
+# Expert Tool support
+from .expert_tool import BedrockConverseReasoner, ExpertToolConfig, ExpertToolReasoner, StrandsAgentReasoner
+
 # Built-in tools (deprecated - use strands_tools.stop instead)
 from .tools import stop_conversation
 
@@ -39,6 +42,11 @@ from .types.events import (
 __all__ = [
     # Main interface
     "BidiAgent",
+    # Expert Tool support
+    "ExpertToolReasoner",
+    "ExpertToolConfig",
+    "BedrockConverseReasoner",
+    "StrandsAgentReasoner",
     # Input Event types
     "BidiTextInputEvent",
     "BidiAudioInputEvent",
