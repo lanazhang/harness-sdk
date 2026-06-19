@@ -154,6 +154,12 @@ class BidiNovaSonicModel(BidiModel):
 
         self._expert_tool_manager: Any | None = None
         if reasoner or expert_tool:
+            if model_id != NOVA_SONIC_V2_MODEL_ID:
+                raise ValueError(
+                    f"Expert Tool (reasoner/expert_tool) is only supported in Nova Sonic v2. "
+                    f"Current model_id: {model_id}. Use {NOVA_SONIC_V2_MODEL_ID} instead."
+                )
+
             from ..expert_tool.config import ExpertToolConfig
             from ..expert_tool.manager import _ExpertToolManager
 

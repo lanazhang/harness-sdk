@@ -211,7 +211,11 @@ class BedrockConverseReasoner:
         return kwargs
 
     def _convert_messages(self, sonic_messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Convert Sonic Expert Tool messages to Bedrock Converse format."""
+        """Convert Sonic Expert Tool messages to Bedrock Converse format.
+
+        Ensures the conversation starts with a user message as required by
+        Bedrock's Converse API. Leading assistant messages are dropped.
+        """
         converted = []
         for msg in sonic_messages:
             role = msg.get("role", "USER").lower()
@@ -222,6 +226,12 @@ class BedrockConverseReasoner:
                     bedrock_content.append({"text": block["text"]})
             if bedrock_content:
                 converted.append({"role": role, "content": bedrock_content})
+
+        # Bedrock requires conversation to start with a user message.
+        # Nova Sonic often sends ASSISTANT first (greeting). Drop leading assistant messages.
+        while converted and converted[0]["role"] == "assistant":
+            converted.pop(0)
+
         return converted
 
     async def _execute_tool(self, name: str, input_data: dict[str, Any]) -> str:
