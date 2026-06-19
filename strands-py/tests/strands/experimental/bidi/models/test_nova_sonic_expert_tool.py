@@ -60,7 +60,7 @@ def mock_reasoner():
 def test_config_defaults():
     config = ExpertToolConfig(reasoner=Mock())
     assert config.max_tool_iterations == 5
-    assert config.streaming_strategy == "sentence"
+    assert config.on_interrupted is None
     assert config.fallback_message == "I'm not sure how to help with that."
 
 
