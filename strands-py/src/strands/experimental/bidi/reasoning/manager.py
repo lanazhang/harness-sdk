@@ -1,7 +1,7 @@
-"""Internal Expert Tool lifecycle manager.
+"""Internal reasoner lifecycle manager.
 
-NOT exposed to developers. Handles all low-level Nova Sonic event protocol
-for the Expert Tool: content containers, streaming, barge-in cancellation.
+NOT exposed to developers. Handles low-level Nova Sonic event protocol
+for streaming and barge-in cancellation.
 
 This class is instantiated by BidiNovaSonicModel when a reasoner is configured.
 """
@@ -14,16 +14,16 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from ..models.nova_sonic import BidiNovaSonicModel
-    from .config import ExpertToolConfig
+    from .config import ReasonerConfig
 
 logger = logging.getLogger(__name__)
 
 
-class _ExpertToolManager:
-    """Manages Expert Tool invocations within BidiNovaSonicModel.
+class _ReasonerManager:
+    """Manages reasoner invocations within BidiNovaSonicModel.
 
     Responsibilities:
-    - Receives ExpertTool toolUse events from Nova Sonic
+    - Receives reasoner toolUse events from Nova Sonic
     - Cancels previous reasoning on barge-in (user interruption)
     - Opens content containers (contentStart)
     - Streams reasoner output as toolResult events
@@ -31,13 +31,7 @@ class _ExpertToolManager:
     - Handles errors with fallback responses
     """
 
-    def __init__(self, model: "BidiNovaSonicModel", config: "ExpertToolConfig") -> None:
-        """Initialize the Expert Tool manager.
-
-        Args:
-            model: The BidiNovaSonicModel instance (for sending events).
-            config: Expert Tool configuration with reasoner and settings.
-        """
+    def __init__(self, model: "BidiNovaSonicModel", config: "ReasonerConfig") -> None:
         self._model = model
         self._config = config
         self._active_task: asyncio.Task | None = None
@@ -48,16 +42,11 @@ class _ExpertToolManager:
         self._content_closed: bool = False
 
     async def handle_invocation(self, tool_use: dict[str, Any]) -> None:
-        """Handle a new Expert Tool invocation from Nova Sonic.
-
-        Cancels any active reasoning task (barge-in), then starts a new
-        reasoning task with the conversation messages from the invocation.
+        """Handle a new reasoner invocation.
 
         Args:
-            tool_use: The toolUse event data from Nova Sonic containing
-                toolUseId and content (JSON string with messages).
+            tool_use: The toolUse event data containing toolUseId and content.
         """
-        # Extract conversation messages from tool content
         messages = self._extract_messages(tool_use)
         if not self._has_user_message(messages):
             logger.debug("tool_use_id=<%s> | skipping — no user message", tool_use.get("toolUseId", "?")[:8])
@@ -66,7 +55,6 @@ class _ExpertToolManager:
         # Cancel previous invocation (barge-in)
         await self._cancel_active()
 
-        # Start new reasoning task
         tool_use_id = tool_use["toolUseId"]
         content_name = str(uuid.uuid4())
 
@@ -76,10 +64,8 @@ class _ExpertToolManager:
         self._data_sent = False
         self._content_closed = False
 
-        logger.debug("tool_use_id=<%s> | starting expert tool reasoning", tool_use_id[:8])
-        self._active_task = asyncio.create_task(
-            self._run(messages, tool_use_id, content_name)
-        )
+        logger.debug("tool_use_id=<%s> | starting reasoning", tool_use_id[:8])
+        self._active_task = asyncio.create_task(self._run(messages, tool_use_id, content_name))
         self._active_task.add_done_callback(self._on_task_done)
 
     async def _cancel_active(self) -> None:
@@ -91,7 +77,6 @@ class _ExpertToolManager:
             except asyncio.CancelledError:
                 pass
 
-        # Close open content container if data was sent but not yet closed
         if self._active_content_name and self._content_opened and self._data_sent and not self._content_closed:
             try:
                 await self._send_content_end(self._active_content_name)
@@ -99,7 +84,6 @@ class _ExpertToolManager:
             except Exception as e:
                 logger.debug("error closing content on cancel: %s", e)
 
-        # Notify callback if configured
         if self._config.on_interrupted:
             try:
                 self._config.on_interrupted()
@@ -113,25 +97,12 @@ class _ExpertToolManager:
         self._data_sent = False
         self._content_closed = False
 
-    async def _run(
-        self, messages: list[dict[str, Any]], tool_use_id: str, content_name: str
-    ) -> None:
-        """Run reasoning and stream results back to Nova Sonic.
-
-        Opens a content container, streams reasoner output as toolResult
-        events, and closes the container when done.
-
-        Args:
-            messages: Conversation messages extracted from the Expert Tool invocation.
-            tool_use_id: The toolUseId from Nova Sonic (for content container linkage).
-            content_name: Unique content name for this result stream.
-        """
+    async def _run(self, messages: list[dict[str, Any]], tool_use_id: str, content_name: str) -> None:
+        """Run reasoning and stream results back to Nova Sonic."""
         try:
-            # Open content container
             await self._send_tool_content_start(content_name, tool_use_id)
             self._content_opened = True
 
-            # Stream from reasoner
             reasoner = self._config.reasoner
             async for sentence in reasoner.reason(messages):
                 if not sentence:
@@ -140,22 +111,18 @@ class _ExpertToolManager:
                 await self._send_tool_result(content_name, payload)
                 self._data_sent = True
 
-            # Fallback if reasoner yielded nothing
             if not self._data_sent:
                 fallback = json.dumps({"text": self._config.fallback_message, "type": "TEXT"})
                 await self._send_tool_result(content_name, fallback)
                 self._data_sent = True
 
-            # Close content container
             await self._send_content_end(content_name)
             self._content_closed = True
 
         except asyncio.CancelledError:
-            # Barge-in — task was cancelled, cleanup handled by _cancel_active
             raise
         except Exception as e:
-            logger.error("expert tool error: %s", e)
-            # Send error fallback
+            logger.error("reasoner error: %s", e)
             try:
                 if not self._content_opened:
                     await self._send_tool_content_start(content_name, tool_use_id)
@@ -173,61 +140,55 @@ class _ExpertToolManager:
         """Shutdown the manager, cancelling any active task."""
         await self._cancel_active()
 
-    # -------------------------------------------------------------------------
-    # Event helpers — send Nova Sonic protocol events
-    # -------------------------------------------------------------------------
-
     async def _send_tool_content_start(self, content_name: str, tool_use_id: str) -> None:
-        """Send contentStart event to open a tool result stream."""
-        event = json.dumps({
-            "event": {
-                "contentStart": {
-                    "promptName": self._model._connection_id,
-                    "contentName": content_name,
-                    "interactive": False,
-                    "type": "TOOL",
-                    "role": "TOOL",
-                    "toolResultInputConfiguration": {
-                        "toolUseId": tool_use_id,
-                        "type": "TEXT",
-                        "textInputConfiguration": {"mediaType": "text/plain"},
-                    },
+        event = json.dumps(
+            {
+                "event": {
+                    "contentStart": {
+                        "promptName": self._model._connection_id,
+                        "contentName": content_name,
+                        "interactive": False,
+                        "type": "TOOL",
+                        "role": "TOOL",
+                        "toolResultInputConfiguration": {
+                            "toolUseId": tool_use_id,
+                            "type": "TEXT",
+                            "textInputConfiguration": {"mediaType": "text/plain"},
+                        },
+                    }
                 }
             }
-        })
+        )
         await self._model._send_nova_events([event])
 
     async def _send_tool_result(self, content_name: str, content: str) -> None:
-        """Send a toolResult event with text content."""
-        event = json.dumps({
-            "event": {
-                "toolResult": {
-                    "promptName": self._model._connection_id,
-                    "contentName": content_name,
-                    "content": content,
+        event = json.dumps(
+            {
+                "event": {
+                    "toolResult": {
+                        "promptName": self._model._connection_id,
+                        "contentName": content_name,
+                        "content": content,
+                    }
                 }
             }
-        })
+        )
         await self._model._send_nova_events([event])
 
     async def _send_content_end(self, content_name: str) -> None:
-        """Send contentEnd event to close the tool result stream."""
-        event = json.dumps({
-            "event": {
-                "contentEnd": {
-                    "promptName": self._model._connection_id,
-                    "contentName": content_name,
+        event = json.dumps(
+            {
+                "event": {
+                    "contentEnd": {
+                        "promptName": self._model._connection_id,
+                        "contentName": content_name,
+                    }
                 }
             }
-        })
+        )
         await self._model._send_nova_events([event])
 
-    # -------------------------------------------------------------------------
-    # Message extraction helpers
-    # -------------------------------------------------------------------------
-
     def _extract_messages(self, tool_use: dict[str, Any]) -> list[dict[str, Any]]:
-        """Extract conversation messages from the Expert Tool content payload."""
         try:
             content_str = tool_use.get("content", "{}")
             if isinstance(content_str, str):
@@ -236,18 +197,15 @@ class _ExpertToolManager:
                 content = content_str
             return content.get("messages", [])
         except (json.JSONDecodeError, AttributeError):
-            logger.debug("failed to extract messages from expert tool content")
+            logger.debug("failed to extract messages from content")
             return []
 
     def _has_user_message(self, messages: list[dict[str, Any]]) -> bool:
-        """Check if messages contain at least one USER message with text."""
         return any(
-            m.get("role", "").upper() == "USER"
-            and any(p.get("text", "").strip() for p in m.get("content", []))
+            m.get("role", "").upper() == "USER" and any(p.get("text", "").strip() for p in m.get("content", []))
             for m in messages
         )
 
     def _on_task_done(self, task: asyncio.Task) -> None:
-        """Callback when reasoning task completes."""
         if task.done() and not task.cancelled() and task.exception():
-            logger.debug("expert tool task failed: %s", task.exception())
+            logger.debug("reasoning task failed: %s", task.exception())

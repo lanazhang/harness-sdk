@@ -127,7 +127,7 @@ class BidiNovaSonicModel(BidiModel):
         provider_config: dict[str, Any] | None = None,
         client_config: dict[str, Any] | None = None,
         reasoner: Any | None = None,
-        expert_tool: Any | None = None,
+        reasoner_config: Any | None = None,
         **kwargs: Any,
     ) -> None:
         """Initialize Nova Sonic bidirectional model.
@@ -140,41 +140,37 @@ class BidiNovaSonicModel(BidiModel):
                 - turn_detection: Turn detection configuration (v2 only feature)
                   - endpointingSensitivity: "HIGH" | "MEDIUM" | "LOW" (optional)
             client_config: AWS authentication (boto_session OR region, not both)
-            reasoner: ExpertToolReasoner instance to enable Expert Tool mode (shorthand).
-                When set, Nova Sonic delegates reasoning to this external LLM.
-            expert_tool: ExpertToolConfig instance for advanced Expert Tool configuration.
+            reasoner: Reasoner instance for custom reasoning (shorthand).
+            reasoner_config: ReasonerConfig instance for advanced configuration.
                 Mutually exclusive with `reasoner`.
             **kwargs: Reserved for future parameters.
 
         Raises:
             ValueError: If turn_detection is used with v1 model.
             ValueError: If endpointingSensitivity is not HIGH, MEDIUM, or LOW.
-            ValueError: If both reasoner and expert_tool are specified.
+            ValueError: If both reasoner and reasoner_config are specified.
         """
         # Store model ID
         self.model_id = model_id
 
-        # Expert Tool setup
-        if reasoner and expert_tool:
-            raise ValueError("Cannot specify both 'reasoner' and 'expert_tool'. Use one or the other.")
+        # Reasoner setup
+        if reasoner and reasoner_config:
+            raise ValueError("Cannot specify both 'reasoner' and 'reasoner_config'. Use one or the other.")
 
-        self._expert_tool_manager: Any | None = None
-        if reasoner or expert_tool:
+        self._reasoner_manager: Any | None = None
+        if reasoner or reasoner_config:
             if model_id != NOVA_SONIC_V2_MODEL_ID:
-                raise ValueError(
-                    f"Expert Tool (reasoner/expert_tool) is only supported in Nova Sonic v2. "
-                    f"Current model_id: {model_id}. Use {NOVA_SONIC_V2_MODEL_ID} instead."
-                )
+                raise ValueError(f"reasoner requires model_id={NOVA_SONIC_V2_MODEL_ID!r}, got {model_id!r}")
 
-            from ..expert_tool.config import ExpertToolConfig
-            from ..expert_tool.manager import _ExpertToolManager
+            from ..reasoning.config import ReasonerConfig
+            from ..reasoning.manager import _ReasonerManager
 
             if reasoner:
-                config = ExpertToolConfig(reasoner=reasoner)
+                config = ReasonerConfig(reasoner=reasoner)
             else:
-                config = expert_tool
+                config = reasoner_config
 
-            self._expert_tool_manager = _ExpertToolManager(self, config)
+            self._reasoner_manager = _ReasonerManager(self, config)
 
         # Validate turn_detection configuration
         provider_config = provider_config or {}
@@ -588,9 +584,9 @@ class BidiNovaSonicModel(BidiModel):
         """Close Nova Sonic connection with proper cleanup sequence."""
         logger.debug("nova connection cleanup starting")
 
-        async def stop_expert_tool() -> None:
-            if self._expert_tool_manager:
-                await self._expert_tool_manager.shutdown()
+        async def stop_reasoner() -> None:
+            if self._reasoner_manager:
+                await self._reasoner_manager.shutdown()
 
         async def stop_events() -> None:
             if not self._connection_id:
@@ -609,7 +605,7 @@ class BidiNovaSonicModel(BidiModel):
         async def stop_connection() -> None:
             self._connection_id = None
 
-        await stop_all(stop_expert_tool, stop_events, stop_stream, stop_connection)
+        await stop_all(stop_reasoner, stop_events, stop_stream, stop_connection)
 
         logger.debug("nova connection closed")
 
@@ -669,11 +665,9 @@ class BidiNovaSonicModel(BidiModel):
         if "toolUse" in nova_event:
             tool_use = nova_event["toolUse"]
 
-            # Intercept ExpertTool — route to manager, not normal tool flow
-            if tool_use["toolName"] == "ExpertTool" and self._expert_tool_manager:
-                asyncio.create_task(
-                    self._expert_tool_manager.handle_invocation(tool_use)
-                )
+            # Route to reasoner manager
+            if tool_use["toolName"] == "ExpertTool" and self._reasoner_manager:
+                asyncio.create_task(self._reasoner_manager.handle_invocation(tool_use))
                 return None  # Don't emit as ToolUseStreamEvent
 
             tool_use_event: ToolUse = {
@@ -760,13 +754,13 @@ class BidiNovaSonicModel(BidiModel):
             prompt_start_event["event"]["promptStart"]["toolUseOutputConfiguration"] = NOVA_TOOL_CONFIG
             prompt_start_event["event"]["promptStart"]["toolConfiguration"] = {"tools": tool_config}
 
-        # Inject ExpertTool spec if expert tool manager is active
-        if self._expert_tool_manager:
-            expert_tool_spec = self._build_expert_tool_spec()
+        # Inject reasoner tool spec if configured
+        if self._reasoner_manager:
+            reasoner_tool_spec = self._build_reasoner_tool_spec()
             if "toolConfiguration" not in prompt_start_event["event"]["promptStart"]:
                 prompt_start_event["event"]["promptStart"]["toolUseOutputConfiguration"] = NOVA_TOOL_CONFIG
                 prompt_start_event["event"]["promptStart"]["toolConfiguration"] = {"tools": []}
-            prompt_start_event["event"]["promptStart"]["toolConfiguration"]["tools"].append(expert_tool_spec)
+            prompt_start_event["event"]["promptStart"]["toolConfiguration"]["tools"].append(reasoner_tool_spec)
 
         return json.dumps(prompt_start_event)
 
@@ -785,32 +779,34 @@ class BidiNovaSonicModel(BidiModel):
             )
         return tool_config
 
-    def _build_expert_tool_spec(self) -> dict[str, Any]:
-        """Build the ExpertTool spec for Nova Sonic registration."""
-        schema = json.dumps({
-            "type": "object",
-            "required": ["messages"],
-            "properties": {
-                "messages": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "required": ["role", "content"],
-                        "properties": {
-                            "role": {"type": "string", "enum": ["USER", "ASSISTANT"]},
-                            "content": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "required": ["text"],
-                                    "properties": {"text": {"type": "string"}},
+    def _build_reasoner_tool_spec(self) -> dict[str, Any]:
+        """Build the reasoner tool spec for Nova Sonic registration."""
+        schema = json.dumps(
+            {
+                "type": "object",
+                "required": ["messages"],
+                "properties": {
+                    "messages": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["role", "content"],
+                            "properties": {
+                                "role": {"type": "string", "enum": ["USER", "ASSISTANT"]},
+                                "content": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "required": ["text"],
+                                        "properties": {"text": {"type": "string"}},
+                                    },
                                 },
                             },
                         },
-                    },
-                }
-            },
-        })
+                    }
+                },
+            }
+        )
         return {
             "toolSpec": {
                 "name": "ExpertTool",

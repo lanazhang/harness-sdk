@@ -1,59 +1,36 @@
-"""Expert Tool Reasoner protocol and built-in implementations.
-
-Provides:
-- ExpertToolReasoner: Protocol for custom reasoning implementations.
-- BedrockConverseReasoner: Built-in reasoner using Bedrock ConverseStream.
-- StrandsAgentReasoner: Wraps any Strands Agent as a reasoner.
-"""
+"""Reasoner protocol and built-in implementations."""
 
 import asyncio
 import json
 import logging
-from typing import Any, AsyncGenerator, Protocol, runtime_checkable
+from collections.abc import AsyncGenerator
+from typing import Any, Protocol, runtime_checkable
 
 logger = logging.getLogger(__name__)
 
 
 @runtime_checkable
-class ExpertToolReasoner(Protocol):
-    """Protocol for Expert Tool reasoning implementations.
+class Reasoner(Protocol):
+    """Protocol for reasoning implementations.
 
-    Implement this to bring any LLM as the reasoning layer for Nova Sonic.
-    The SDK calls `reason()` when Nova Sonic emits an Expert Tool invocation.
+    Args:
+        messages: Conversation messages (USER/ASSISTANT turns).
+            Format: [{"role": "USER", "content": [{"text": "..."}]}, ...]
 
-    The contract is simple: receive conversation messages, yield text sentences.
-    Each yielded string is streamed back to Sonic for TTS.
+    Yields:
+        Text chunks (sentences) to stream back for TTS.
     """
 
     async def reason(
         self,
         messages: list[dict[str, Any]],
     ) -> AsyncGenerator[str, None]:
-        """Stream reasoning response sentence by sentence.
-
-        Args:
-            messages: Conversation messages from Nova Sonic (USER/ASSISTANT turns).
-                Format: [{"role": "USER", "content": [{"text": "..."}]}, ...]
-
-        Yields:
-            Text chunks (sentences) to stream back to Sonic for TTS.
-            Each yield becomes a separate toolResult event.
-        """
+        """Stream reasoning response sentence by sentence."""
         ...
 
 
 class BedrockConverseReasoner:
-    """Built-in reasoner using Bedrock ConverseStream.
-
-    Wraps any Bedrock Converse-compatible model (Claude, Nova Pro, Qwen,
-    custom/fine-tuned models, etc.) and handles:
-    - Streaming text output sentence-by-sentence
-    - Tool calling loops (up to max_iterations)
-    - Error recovery with fallback responses
-
-    The model parameter accepts a Strands BedrockModel instance, giving full
-    control over region, credentials, guardrails, and inference config.
-    """
+    """Reasoner backed by Bedrock's ConverseStream API."""
 
     def __init__(
         self,
@@ -67,8 +44,8 @@ class BedrockConverseReasoner:
         Args:
             model: A Strands BedrockModel instance.
             system_prompt: System prompt for the reasoning LLM.
-            tools: List of @tool decorated functions the reasoner can call.
-            max_iterations: Max tool call loops per turn before fallback.
+            tools: List of @tool decorated functions.
+            max_iterations: Max tool call loops per turn.
         """
         self.model = model
         self.system_prompt = system_prompt
@@ -76,6 +53,7 @@ class BedrockConverseReasoner:
         self._tools = tools or []
         self._tool_specs = self._build_tool_specs(self._tools)
         self._tool_executors = self._build_tool_executors(self._tools)
+        self._conversation_history: list[dict[str, Any]] = []
 
     async def reason(
         self,
@@ -83,27 +61,13 @@ class BedrockConverseReasoner:
     ) -> AsyncGenerator[str, None]:
         """Stream reasoning with automatic tool calling loops.
 
-        Converts Sonic messages to Bedrock Converse format, streams the response,
-        and handles tool calls internally. Yields sentences for TTS.
-
-        Args:
-            messages: Conversation messages from Nova Sonic Expert Tool invocation.
-
-        Yields:
-            Text sentences ready for TTS.
+        Maintains conversation history across invocations.
         """
-        logger.debug("reasoner_model=<%s> | Expert Tool invoked", self.model.config["model_id"])
-        logger.debug("messages_count=<%d> | conversation context received", len(messages))
-        for i, msg in enumerate(messages):
-            role = msg.get("role", "?")
-            text = ""
-            for block in msg.get("content", []):
-                if "text" in block:
-                    text = block["text"][:100]
-                    break
-            logger.debug("  [%d] role=<%s> text=<%s>", i, role, text)
+        logger.debug("reasoner_model=<%s> | invoked", self.model.config["model_id"])
 
-        working_messages = self._convert_messages(messages)
+        new_messages = self._convert_messages(messages)
+        self._conversation_history.extend(new_messages)
+        working_messages = list(self._conversation_history)
 
         for _ in range(self.max_iterations):
             full_text = ""
@@ -113,7 +77,7 @@ class BedrockConverseReasoner:
 
             request_kwargs = self._build_request(working_messages)
             response = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: self.model.client.converse_stream(**request_kwargs)
+                None, lambda kw=request_kwargs: self.model.client.converse_stream(**kw)
             )
 
             for event in response.get("stream", []):
@@ -131,7 +95,6 @@ class BedrockConverseReasoner:
                         token = delta["text"]
                         full_text += token
                         buffer += token
-                        # Yield complete sentences (split on newline)
                         while "\n" in buffer:
                             sentence, buffer = buffer.split("\n", 1)
                             if sentence.strip():
@@ -150,44 +113,32 @@ class BedrockConverseReasoner:
                         tool_requests.append(current_tool)
                         current_tool = None
 
-            # Yield remaining buffer
             if buffer.strip():
                 yield buffer.strip()
 
-            # No tool calls — done
             if not tool_requests:
+                if full_text:
+                    self._conversation_history.append({"role": "assistant", "content": [{"text": full_text}]})
                 return
 
-            # Execute tools and continue the loop
             assistant_content: list[dict[str, Any]] = []
             if full_text:
                 assistant_content.append({"text": full_text})
             for tr in tool_requests:
-                assistant_content.append({
-                    "toolUse": {
-                        "toolUseId": tr["toolUseId"],
-                        "name": tr["name"],
-                        "input": tr["input"],
-                    }
-                })
+                assistant_content.append(
+                    {"toolUse": {"toolUseId": tr["toolUseId"], "name": tr["name"], "input": tr["input"]}}
+                )
             working_messages.append({"role": "assistant", "content": assistant_content})
 
             tool_results: list[dict[str, Any]] = []
             for tr in tool_requests:
                 result = await self._execute_tool(tr["name"], tr["input"])
-                tool_results.append({
-                    "toolResult": {
-                        "toolUseId": tr["toolUseId"],
-                        "content": [{"text": result}],
-                    }
-                })
+                tool_results.append({"toolResult": {"toolUseId": tr["toolUseId"], "content": [{"text": result}]}})
             working_messages.append({"role": "user", "content": tool_results})
 
-        # Fallback after max iterations
         yield "I'm sorry, I wasn't able to complete that request."
 
     def _build_request(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
-        """Build the converse_stream request kwargs."""
         kwargs: dict[str, Any] = {
             "modelId": self.model.config["model_id"],
             "system": [{"text": self.system_prompt}],
@@ -199,99 +150,58 @@ class BedrockConverseReasoner:
         }
         if self._tool_specs:
             kwargs["toolConfig"] = {"tools": self._tool_specs}
-
-        # Include guardrails if configured on the model
         if self.model.config.get("guardrail_id") and self.model.config.get("guardrail_version"):
             kwargs["guardrailConfig"] = {
                 "guardrailIdentifier": self.model.config["guardrail_id"],
                 "guardrailVersion": self.model.config["guardrail_version"],
                 "trace": self.model.config.get("guardrail_trace", "enabled"),
             }
-
         return kwargs
 
     def _convert_messages(self, sonic_messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Convert Sonic Expert Tool messages to Bedrock Converse format.
-
-        Ensures the conversation starts with a user message as required by
-        Bedrock's Converse API. Leading assistant messages are dropped.
-        """
+        """Convert messages to Bedrock Converse format, stripping leading assistant messages."""
         converted = []
         for msg in sonic_messages:
             role = msg.get("role", "USER").lower()
-            content_blocks = msg.get("content", [])
-            bedrock_content = []
-            for block in content_blocks:
-                if "text" in block:
-                    bedrock_content.append({"text": block["text"]})
+            bedrock_content = [{"text": b["text"]} for b in msg.get("content", []) if "text" in b]
             if bedrock_content:
                 converted.append({"role": role, "content": bedrock_content})
-
-        # Bedrock requires conversation to start with a user message.
-        # Nova Sonic often sends ASSISTANT first (greeting). Drop leading assistant messages.
         while converted and converted[0]["role"] == "assistant":
             converted.pop(0)
-
         return converted
 
     async def _execute_tool(self, name: str, input_data: dict[str, Any]) -> str:
-        """Execute a registered tool by name."""
         executor = self._tool_executors.get(name)
         if executor:
             try:
                 result = executor(**input_data)
                 return result if isinstance(result, str) else json.dumps(result)
             except Exception as e:
-                logger.error(f"Tool execution error: {name} - {e}")
+                logger.error("Tool execution error: %s - %s", name, e)
                 return json.dumps({"error": str(e)})
         return json.dumps({"error": f"Unknown tool: {name}"})
 
     def _build_tool_specs(self, tools: list[Any]) -> list[dict[str, Any]]:
-        """Convert @tool functions to Bedrock tool spec format."""
         specs = []
         for t in tools:
             if hasattr(t, "tool_spec"):
-                spec = t.tool_spec
-                specs.append({"toolSpec": spec})
+                specs.append({"toolSpec": t.tool_spec})
             elif hasattr(t, "TOOL_SPEC"):
                 specs.append({"toolSpec": t.TOOL_SPEC})
         return specs
 
     def _build_tool_executors(self, tools: list[Any]) -> dict[str, Any]:
-        """Map tool names to callable executors."""
         executors: dict[str, Any] = {}
         for t in tools:
             if hasattr(t, "tool_spec"):
-                name = t.tool_spec.get("name", "")
-                executors[name] = t
+                executors[t.tool_spec.get("name", "")] = t
             elif hasattr(t, "TOOL_SPEC"):
-                name = t.TOOL_SPEC.get("name", "")
-                executors[name] = t
+                executors[t.TOOL_SPEC.get("name", "")] = t
         return executors
 
 
 class StrandsAgentReasoner:
-    """Wraps any Strands Agent as an ExpertToolReasoner.
-
-    This gives Expert Tool access to all Strands-supported model providers
-    (Bedrock, OpenAI, Gemini, Anthropic, Ollama, LiteLLM, Mistral, etc.)
-    without writing custom reasoner implementations.
-
-    The Agent handles tool calling internally — the reasoner just invokes it
-    and yields the response text.
-
-    Usage:
-        from strands import Agent
-        from strands.models.openai import OpenAIModel
-
-        openai_agent = Agent(
-            model=OpenAIModel(model_id="gpt-4o"),
-            tools=[get_weather],
-            system_prompt="You are a helpful voice assistant.",
-        )
-        reasoner = StrandsAgentReasoner(agent=openai_agent)
-        model = BidiNovaSonicModel(reasoner=reasoner)
-    """
+    """Wraps a Strands Agent as a Reasoner."""
 
     def __init__(self, agent: Any):
         """Initialize with a Strands Agent instance.
@@ -307,11 +217,8 @@ class StrandsAgentReasoner:
     ) -> AsyncGenerator[str, None]:
         """Invoke the Strands Agent and yield response sentences.
 
-        Extracts the latest user text from Sonic messages, invokes the agent,
-        and splits the response into sentences for TTS.
-
         Args:
-            messages: Conversation messages from Nova Sonic Expert Tool invocation.
+            messages: Conversation messages.
 
         Yields:
             Text sentences from the agent response.
@@ -321,18 +228,14 @@ class StrandsAgentReasoner:
             yield "I didn't catch that. Could you say it again?"
             return
 
-        # Invoke the agent (runs synchronously with its own tool loops)
-        result = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: self.agent(user_text)
-        )
+        result = await asyncio.get_event_loop().run_in_executor(None, lambda: self.agent(user_text))
 
-        # Yield response text sentence by sentence
         response_text = str(result)
         for sentence in self._split_sentences(response_text):
             yield sentence
 
     def _extract_latest_user_text(self, messages: list[dict[str, Any]]) -> str:
-        """Extract the most recent user text from Sonic messages."""
+        """Extract the most recent user text from messages."""
         for m in reversed(messages):
             if m.get("role", "").upper() == "USER":
                 parts = m.get("content", [])

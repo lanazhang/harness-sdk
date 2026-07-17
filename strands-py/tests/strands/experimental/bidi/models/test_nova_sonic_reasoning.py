@@ -1,11 +1,11 @@
-"""Unit tests for Expert Tool support in BidiNovaSonicModel."""
+"""Unit tests for custom reasoner support in BidiNovaSonicModel."""
 
 import sys
 
 if sys.version_info < (3, 12):
     import pytest
 
-    pytest.skip(reason="Expert Tool requires Python 3.12+", allow_module_level=True)
+    pytest.skip(reason="Requires Python 3.12+", allow_module_level=True)
 
 import asyncio
 import json
@@ -13,10 +13,10 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
-from strands.experimental.bidi.expert_tool.config import ExpertToolConfig
-from strands.experimental.bidi.expert_tool.manager import _ExpertToolManager
-from strands.experimental.bidi.expert_tool.reasoner import BedrockConverseReasoner, ExpertToolReasoner, StrandsAgentReasoner
-from strands.experimental.bidi.models.nova_sonic import BidiNovaSonicModel, NOVA_SONIC_V1_MODEL_ID
+from strands.experimental.bidi.models.nova_sonic import NOVA_SONIC_V1_MODEL_ID, BidiNovaSonicModel
+from strands.experimental.bidi.reasoning.config import ReasonerConfig
+from strands.experimental.bidi.reasoning.manager import _ReasonerManager
+from strands.experimental.bidi.reasoning.reasoner import Reasoner, StrandsAgentReasoner
 
 
 @pytest.fixture
@@ -58,7 +58,7 @@ def mock_reasoner():
 
 
 def test_config_defaults():
-    config = ExpertToolConfig(reasoner=Mock())
+    config = ReasonerConfig(reasoner=Mock())
     assert config.max_tool_iterations == 5
     assert config.on_interrupted is None
     assert config.fallback_message == "I'm not sure how to help with that."
@@ -68,66 +68,8 @@ def test_config_defaults():
 
 
 def test_protocol_compliance():
-    assert isinstance(BedrockConverseReasoner(model=Mock(config={"model_id": "x"}, client=Mock())), ExpertToolReasoner)
-    assert isinstance(StrandsAgentReasoner(agent=Mock()), ExpertToolReasoner)
-    assert not isinstance(object(), ExpertToolReasoner)
-
-
-# --- BedrockConverseReasoner ---
-
-
-class TestBedrockReasoner:
-    @pytest.fixture
-    def model(self):
-        m = Mock()
-        m.config = {"model_id": "test", "max_tokens": 1024, "temperature": 0.7}
-        m.client = Mock()
-        return m
-
-    def test_convert_messages_strips_leading_assistant(self, model):
-        r = BedrockConverseReasoner(model=model)
-        result = r._convert_messages([
-            {"role": "ASSISTANT", "content": [{"text": "Hi"}]},
-            {"role": "USER", "content": [{"text": "Hello"}]},
-        ])
-        assert len(result) == 1 and result[0]["role"] == "user"
-
-    @pytest.mark.asyncio
-    async def test_execute_tool(self, model):
-        tool = Mock(return_value='{"ok":true}')
-        tool.tool_spec = {"name": "t", "description": "d", "inputSchema": {"json": {}}}
-        r = BedrockConverseReasoner(model=model, tools=[tool])
-        assert await r._execute_tool("t", {"x": 1}) == '{"ok":true}'
-        assert "Unknown" in json.loads(await r._execute_tool("nope", {}))["error"]
-
-    @pytest.mark.asyncio
-    async def test_reason_streams_text(self, model):
-        model.client.converse_stream.return_value = {
-            "stream": [
-                {"contentBlockDelta": {"delta": {"text": "A.\nB."}}},
-                {"contentBlockStop": {}},
-            ]
-        }
-        r = BedrockConverseReasoner(model=model)
-        result = [s async for s in r.reason([{"role": "USER", "content": [{"text": "hi"}]}])]
-        assert "A." in result and "B." in result
-
-    @pytest.mark.asyncio
-    async def test_reason_handles_tool_call(self, model):
-        tool = Mock(return_value='{"r":1}')
-        tool.tool_spec = {"name": "t", "description": "d", "inputSchema": {"json": {}}}
-        model.client.converse_stream.side_effect = [
-            {"stream": [
-                {"contentBlockStart": {"start": {"toolUse": {"toolUseId": "id1", "name": "t"}}}},
-                {"contentBlockDelta": {"delta": {"toolUse": {"input": "{}"}}}},
-                {"contentBlockStop": {}},
-            ]},
-            {"stream": [{"contentBlockDelta": {"delta": {"text": "Done."}}}, {"contentBlockStop": {}}]},
-        ]
-        r = BedrockConverseReasoner(model=model, tools=[tool])
-        result = [s async for s in r.reason([{"role": "USER", "content": [{"text": "go"}]}])]
-        tool.assert_called_once()
-        assert "Done." in result
+    assert isinstance(StrandsAgentReasoner(agent=Mock()), Reasoner)
+    assert not isinstance(object(), Reasoner)
 
 
 # --- StrandsAgentReasoner ---
@@ -155,7 +97,7 @@ class TestStrandsReasoner:
 class TestManager:
     @pytest.mark.asyncio
     async def test_run_streams_and_closes(self, mock_model, mock_reasoner):
-        mgr = _ExpertToolManager(mock_model, ExpertToolConfig(reasoner=mock_reasoner))
+        mgr = _ReasonerManager(mock_model, ReasonerConfig(reasoner=mock_reasoner))
         await mgr._run([{"role": "USER", "content": [{"text": "Hi"}]}], "tu-1", "cn-1")
         events = [json.loads(e) for call in mock_model._send_nova_events.call_args_list for e in call.args[0]]
         assert "contentStart" in events[0]["event"]
@@ -164,7 +106,7 @@ class TestManager:
 
     @pytest.mark.asyncio
     async def test_cancel_sends_content_end(self, mock_model, mock_reasoner):
-        mgr = _ExpertToolManager(mock_model, ExpertToolConfig(reasoner=mock_reasoner))
+        mgr = _ReasonerManager(mock_model, ReasonerConfig(reasoner=mock_reasoner))
         mgr._active_task = asyncio.create_task(asyncio.sleep(100))
         mgr._active_content_name = "cn-1"
         mgr._content_opened = True
@@ -176,7 +118,7 @@ class TestManager:
 
     @pytest.mark.asyncio
     async def test_cancel_skips_if_closed(self, mock_model, mock_reasoner):
-        mgr = _ExpertToolManager(mock_model, ExpertToolConfig(reasoner=mock_reasoner))
+        mgr = _ReasonerManager(mock_model, ReasonerConfig(reasoner=mock_reasoner))
         mgr._active_task = asyncio.create_task(asyncio.sleep(100))
         mgr._active_content_name = "cn-1"
         mgr._content_opened = True
@@ -187,8 +129,9 @@ class TestManager:
 
     @pytest.mark.asyncio
     async def test_skips_no_user_message(self, mock_model, mock_reasoner):
-        mgr = _ExpertToolManager(mock_model, ExpertToolConfig(reasoner=mock_reasoner))
-        await mgr.handle_invocation({"toolUseId": "t1", "content": json.dumps({"messages": [{"role": "ASSISTANT", "content": [{"text": "x"}]}]})})
+        mgr = _ReasonerManager(mock_model, ReasonerConfig(reasoner=mock_reasoner))
+        content = json.dumps({"messages": [{"role": "ASSISTANT", "content": [{"text": "x"}]}]})
+        await mgr.handle_invocation({"toolUseId": "t1", "content": content})
         assert mgr._active_task is None
 
 
@@ -198,17 +141,25 @@ class TestManager:
 class TestNovaSonicIntegration:
     def test_init_with_reasoner(self, boto_session, mock_client, mock_reasoner):
         model = BidiNovaSonicModel(client_config={"boto_session": boto_session}, reasoner=mock_reasoner)
-        assert model._expert_tool_manager is not None
+        assert model._reasoner_manager is not None
 
     def test_init_raises_v1(self, boto_session, mock_client, mock_reasoner):
-        with pytest.raises(ValueError, match="only supported in Nova Sonic v2"):
-            BidiNovaSonicModel(model_id=NOVA_SONIC_V1_MODEL_ID, client_config={"boto_session": boto_session}, reasoner=mock_reasoner)
+        with pytest.raises(ValueError, match="reasoner requires model_id="):
+            BidiNovaSonicModel(
+                model_id=NOVA_SONIC_V1_MODEL_ID,
+                client_config={"boto_session": boto_session},
+                reasoner=mock_reasoner,
+            )
 
     def test_init_raises_both(self, boto_session, mock_client, mock_reasoner):
         with pytest.raises(ValueError, match="Cannot specify both"):
-            BidiNovaSonicModel(client_config={"boto_session": boto_session}, reasoner=mock_reasoner, expert_tool=ExpertToolConfig(reasoner=mock_reasoner))
+            BidiNovaSonicModel(
+                client_config={"boto_session": boto_session},
+                reasoner=mock_reasoner,
+                reasoner_config=ReasonerConfig(reasoner=mock_reasoner),
+            )
 
-    def test_prompt_start_includes_expert_tool(self, boto_session, mock_client, mock_reasoner):
+    def test_prompt_start_includes_reasoner_tool(self, boto_session, mock_client, mock_reasoner):
         model = BidiNovaSonicModel(client_config={"boto_session": boto_session}, reasoner=mock_reasoner)
         model._connection_id = "c"
         event = json.loads(model._get_prompt_start_event(tools=[]))
@@ -216,13 +167,13 @@ class TestNovaSonicIntegration:
         assert any(t["toolSpec"]["name"] == "ExpertTool" for t in tools)
 
     @pytest.mark.asyncio
-    async def test_expert_tool_intercepted(self, boto_session, mock_client, mock_reasoner):
+    async def test_reasoner_tool_intercepted(self, boto_session, mock_client, mock_reasoner):
         model = BidiNovaSonicModel(client_config={"boto_session": boto_session}, reasoner=mock_reasoner)
-        model._expert_tool_manager.handle_invocation = AsyncMock()
+        model._reasoner_manager.handle_invocation = AsyncMock()
         result = model._convert_nova_event({"toolUse": {"toolUseId": "t1", "toolName": "ExpertTool", "content": "{}"}})
         assert result is None
 
     def test_regular_tool_passes_through(self, boto_session, mock_client, mock_reasoner):
         model = BidiNovaSonicModel(client_config={"boto_session": boto_session}, reasoner=mock_reasoner)
-        result = model._convert_nova_event({"toolUse": {"toolUseId": "t1", "toolName": "weather", "content": '{}'}})
+        result = model._convert_nova_event({"toolUse": {"toolUseId": "t1", "toolName": "weather", "content": "{}"}})
         assert result is not None
