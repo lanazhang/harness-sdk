@@ -159,8 +159,8 @@ class BidiNovaSonicModel(BidiModel):
 
         self._reasoner_manager: Any | None = None
         if reasoner or reasoner_config:
-            if model_id != NOVA_SONIC_V2_MODEL_ID:
-                raise ValueError(f"reasoner requires model_id={NOVA_SONIC_V2_MODEL_ID!r}, got {model_id!r}")
+            if model_id == NOVA_SONIC_V1_MODEL_ID:
+                raise ValueError(f"reasoner requires Nova Sonic v2 or above, got {model_id!r}")
 
             from ..reasoning.config import ReasonerConfig
             from ..reasoning.manager import _ReasonerManager

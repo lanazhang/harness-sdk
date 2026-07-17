@@ -144,7 +144,7 @@ class TestNovaSonicIntegration:
         assert model._reasoner_manager is not None
 
     def test_init_raises_v1(self, boto_session, mock_client, mock_reasoner):
-        with pytest.raises(ValueError, match="reasoner requires model_id="):
+        with pytest.raises(ValueError, match="reasoner requires Nova Sonic v2 or above"):
             BidiNovaSonicModel(
                 model_id=NOVA_SONIC_V1_MODEL_ID,
                 client_config={"boto_session": boto_session},
