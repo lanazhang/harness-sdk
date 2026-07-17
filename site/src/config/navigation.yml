@@ -32,6 +32,10 @@ navbar:
     href: /blog/
     basePath: /blog/
     align: right
+  - label: Changelog
+    href: /changelog/
+    basePath: /changelog/
+    align: right
   - label: Labs
     href: https://github.com/strands-labs
     external: true
@@ -40,7 +44,6 @@ navbar:
 sidebar:
   - label: Docs
     items:
-      - docs/index
       - label: Get Started
         items:
           - docs/user-guide/quickstart/overview
@@ -110,6 +113,9 @@ sidebar:
               - docs/user-guide/concepts/plugins/context-injector
               - docs/user-guide/concepts/plugins/goal-loop
           - label: Interventions
+            badge:
+              text: New
+              variant: tip
             items:
               - label: "Overview"
                 slug: docs/user-guide/concepts/agents/interventions
@@ -259,6 +265,7 @@ sidebar:
               - docs/user-guide/evals-sdk/how-to/result_caching
               - docs/user-guide/evals-sdk/how-to/experiment_management
               - docs/user-guide/evals-sdk/how-to/serialization
+              - docs/user-guide/evals-sdk/how-to/agentcore_evaluation_dashboard
       - label: Strands Shell
         items:
           - docs/user-guide/shell
@@ -311,6 +318,10 @@ sidebar:
       - label: Agent Extensions
         items:
           - docs/community/agent-extensions/strands-code-agent
+      - label: Interventions
+        items:
+          - docs/community/interventions/overview
+          - docs/community/interventions/strands-agt
       - label: Plugins
         items:
           - docs/community/plugins/agent-control
@@ -330,6 +341,9 @@ sidebar:
           - docs/community/model-providers/mlx
           - docs/community/model-providers/ovhcloud-ai-endpoints
           - docs/community/model-providers/xai
+      - label: Memory Stores
+        items:
+          - docs/community/memory-stores/overview
       - label: Session Managers
         items:
           - docs/community/session-managers/agentcore-memory
@@ -339,6 +353,7 @@ sidebar:
           - docs/community/tools/utcp
       - label: Tools
         items:
+          - docs/community/tools/strands-apify
           - docs/community/tools/strands-deepgram
           - docs/community/tools/strands-hubspot
           - docs/community/tools/strands-spraay

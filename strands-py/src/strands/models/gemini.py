@@ -259,7 +259,7 @@ class GeminiModel(Model):
 
         return contents
 
-    def _format_request_tools(self, tool_specs: list[ToolSpec] | None) -> list[genai.types.Tool | Any]:
+    def _format_request_tools(self, tool_specs: list[ToolSpec] | None) -> list[genai.types.Tool | Any] | None:
         """Format tool specs into Gemini tools.
 
         - Docs: https://googleapis.github.io/python-genai/genai.html#genai.types.Tool
@@ -268,8 +268,10 @@ class GeminiModel(Model):
             tool_specs: List of tool specifications to make available to the model.
 
         Return:
-            Gemini tool list.
+            Gemini tool list, or None when no tools are configured (Vertex AI rejects empty arrays).
         """
+        if not tool_specs and not self.config.get("gemini_tools"):
+            return None
         tools = [
             genai.types.Tool(
                 function_declarations=[
@@ -556,6 +558,10 @@ class GeminiModel(Model):
 
                 for part in parts:
                     if part.function_call:
+                        if data_type is not None:
+                            yield self._format_chunk({"chunk_type": "content_stop", "data_type": data_type})
+                            data_type = None
+
                         yield self._format_chunk({"chunk_type": "content_start", "data_type": "tool", "data": part})
                         yield self._format_chunk({"chunk_type": "content_delta", "data_type": "tool", "data": part})
                         yield self._format_chunk({"chunk_type": "content_stop", "data_type": "tool", "data": part})
@@ -588,21 +594,11 @@ class GeminiModel(Model):
                 yield self._format_chunk({"chunk_type": "metadata", "data": event.usage_metadata})
 
         except genai.errors.ClientError as error:
-            if not error.message:
-                raise
-
-            try:
-                message = json.loads(error.message) if error.message else {}
-            except json.JSONDecodeError as e:
-                logger.warning("error_message=<%s> | Gemini API returned non-JSON error", error.message)
-                # Re-raise the original ClientError (not JSONDecodeError) and make the JSON error the explicit cause
-                raise error from e
-
-            match message["error"]["status"]:
+            match error.status:
                 case "RESOURCE_EXHAUSTED" | "UNAVAILABLE":
-                    raise ModelThrottledException(error.message) from error
+                    raise ModelThrottledException(error.message or str(error)) from error
                 case "INVALID_ARGUMENT":
-                    if "exceeds the maximum number of tokens" in message["error"]["message"]:
+                    if error.message and "exceeds the maximum number of tokens" in error.message:
                         raise ContextWindowOverflowException(error.message) from error
                     raise error
                 case _:
